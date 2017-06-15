@@ -7,6 +7,7 @@ require 'scutil'
 require 'stringio'
 require 'date'
 require 'awesome_print'
+require 'logger'
 
 # Backup all instances for tenants in TENANT_MAP to an external SSH
 # server.
@@ -29,6 +30,8 @@ require 'awesome_print'
 # 4. Check each instance's state (as reported by Nova) at start and/or
 #    before snapshotting.
 
+LOGGER = Logger.new("backup.log")
+LOGGER.level = Logger::WARN
 KEYSTONE_URI = "http://10.0.4.3:35357/v2.0"
 COMPUTE_URI = "http://10.0.4.3:8774/v2"
 API_USER = "admin"
@@ -101,6 +104,7 @@ def get_token(tenant_id=nil)
     tenant_value = tenant_id
   end
   begin
+    LOGGER.info("Getting Auth Token")
     response = RestClient.post(KEYSTONE_URI + "/tokens",
                                {
                                  auth: {
@@ -114,6 +118,7 @@ def get_token(tenant_id=nil)
                                content_type: :json, accept: :json) # {|response, request, result| p request }
   rescue => e
     ap e
+    LOGGER.error(e)
     exit 1
   end
   
@@ -125,9 +130,11 @@ end
 # objects.
 def get_tenants(auth_token)
   begin
+    LOGGER.info("Getting Tenant List")
     response = RestClient.get(KEYSTONE_URI + "/tenants", accept: :json, 'X-Auth-Token' => auth_token)
   rescue => e
     ap e
+    LOGGER.error(e)
     exit 1
   end
 
@@ -148,8 +155,10 @@ end
 # Query the compute API with a URI.  Returns a JSON object.
 def compute_api_query_with_uri(uri, auth_token)
   begin
+    LOGGER.info("Querying Compute API")
     response = RestClient.get(uri, accept: :json, 'X-Auth-Token' => auth_token)
   rescue => e
+    LOGGER.error(e)
     ap e
   end
   
@@ -159,9 +168,11 @@ end
 # Post an action to the compute API.  Returns the headers as the response.
 def compute_api_action(resource, request_body, tenant_id, auth_token)
   begin
+    LOGGER.info("Getting API Headers")
     response = RestClient.post(COMPUTE_URI + "/#{tenant_id}/#{resource}", request_body,
                                content_type: :json, accept: :json, 'X-Auth-Token' => auth_token)
   rescue => e
+    LOGGER.error(e)
     ap e
   end
   
@@ -222,6 +233,7 @@ end
 def poll_for_image(image_location, auth_token)
   response = {}
   begin
+    LOGGER.info("Waiting for snapshot to complete.")
     Timeout::timeout(SNAPSHOT_TIMEOUT) do
       response = compute_api_query_with_uri(image_location, auth_token)[:image]
       while (response[:status] != "ACTIVE")
@@ -231,6 +243,7 @@ def poll_for_image(image_location, auth_token)
     end
     return true
   rescue Timeout::Error
+    LOGGER.error("ERROR: Timeout waiting for image creation.  Last Status: #{response[:status]}.  Last Progress: #{response[:progress]}")
     puts "  Error: Timeout waiting for image creation."
     puts "    Last status was #{response[:status]}"
     puts "    Last progress was #{response[:progress]}"
@@ -246,14 +259,17 @@ def transfer_images(instances)
     printf "  %-20s", "#{i.name}..."
     image_size = nil
     begin
+      LOGGER.info("Transferring image #{i.name} to #{BACKUP_HOST}")
       Scutil.upload(BACKUP_HOST, BACKUP_USER, "/var/lib/glance/images/#{i.image_id}", "snapshots/#{i.snapshot_name}.img",
                     { key_data: [ BACKUP_KEY ] }) do |ch, name, sent, total|
         image_size = total
       end
       total_bytes += image_size
     rescue Scutil::Error => err
+      LOGGER.error(err.message)
       puts "FAILED"
       puts "Error: " + err.message
+      LOGGER.error(err.message)
       next
     end
     puts "success"
@@ -266,8 +282,10 @@ def clean_up_openstack(instances, tenant_id, auth_token)
   puts "Removing snapshots from OpenStack"
   instances.each do |i|
     begin
+      LOGGER.info("Removing #{i.name} from OpenStack")
       response = RestClient.delete("#{COMPUTE_URI}/#{tenant_id}/images/#{i.image_id}", 'X-Auth-Token' => auth_token)
     rescue => e
+      LOGGER.error(e)
       ap e
       exit 1
     end
@@ -328,3 +346,5 @@ duration = end_run - start_run
 
 puts "\n#{total_successful} of #{total_attempted} successfully backed up in #{(duration/60).floor} minutes."
 printf "%.1fGB transferred to #{BACKUP_HOST}.\n", total_bytes / 1000000000
+LOGGER.info("\n#{total_successful} of #{total_attempted} successfully backed up in #{(duration/60).floor} minutes.")
+LOGGER.info("%.1fGB transferred to #{BACKUP_HOST}.\n", total_bytes / 1000000000)
